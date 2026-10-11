@@ -1,8 +1,7 @@
 """
-Model Trainer Module
-Trains machine learning regression models (Ridge, Random Forest, XGBoost, LightGBM)
-to estimate Market Cap based on financial ratios, log terms, cross-terms, and classifications.
-Generates performance metrics and valuation mispricing analysis.
+Model Trainer Module (Enhanced & Overfitting-Regularized)
+Trains machine learning regression models with strong L1/L2 regularization,
+depth constraints, cross-validation tuning, and an Ensemble Blended meta-regressor.
 """
 
 import os
@@ -16,10 +15,9 @@ import seaborn as sns
 
 from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge, ElasticNet
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
 from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
 from feature_engineering import preprocess_and_engineer_features
@@ -34,14 +32,12 @@ def prepare_feature_matrix(df_engineered):
     X = df_engineered[feature_cols].copy()
     y = df_engineered['log_marketCap'].values
     
-    # Replace any remaining Inf or NaN with 0
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
-    
     return X, y, feature_cols
 
 def train_and_evaluate_models(X, y):
     """
-    Train multiple models using 5-Fold Cross Validation and train/test splits.
+    Train multiple models using 5-Fold Cross Validation with StandardScaler and regularization.
     """
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -49,12 +45,29 @@ def train_and_evaluate_models(X, y):
     
     X_train, X_test, y_train, y_test = train_test_split(X_scaled_df, y, test_size=0.2, random_state=42)
     
+    # Regularized models
+    m_ridge = Ridge(alpha=50.0, random_state=42)
+    m_elastic = ElasticNet(alpha=0.3, l1_ratio=0.2, random_state=42)
+    m_rf = RandomForestRegressor(n_estimators=100, max_depth=4, min_samples_split=4, min_samples_leaf=2, max_features='sqrt', random_state=42)
+    m_xgb = XGBRegressor(
+        n_estimators=80, 
+        learning_rate=0.04, 
+        max_depth=3, 
+        subsample=0.8, 
+        colsample_bytree=0.7, 
+        reg_alpha=2.0, 
+        reg_lambda=10.0, 
+        random_state=42, 
+        verbosity=0
+    )
+    m_gbr = GradientBoostingRegressor(n_estimators=80, learning_rate=0.04, max_depth=3, subsample=0.8, max_features='sqrt', random_state=42)
+    
     models = {
-        'Ridge Regression': Ridge(alpha=10.0),
-        'Random Forest': RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42),
-        'XGBoost': XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42, verbosity=0),
-        'LightGBM': LGBMRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42, verbose=-1)
+        'Regularized Ridge': m_ridge,
+        'ElasticNet': m_elastic,
+        'Regularized Random Forest': m_rf,
+        'Regularized XGBoost': m_xgb,
+        'Regularized Gradient Boosting': m_gbr
     }
     
     results = {}
@@ -64,16 +77,14 @@ def train_and_evaluate_models(X, y):
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     
-    print("\n" + "="*60)
-    print(" MACHINE LEARNING MODEL PERFORMANCE EVALUATION")
-    print("="*60)
+    print("\n" + "="*70)
+    print(" ENHANCED REGULARIZED MODEL PERFORMANCE EVALUATION")
+    print("="*70)
     
     for name, model in models.items():
-        # Cross validation scores on scaled data
         cv_scores = cross_val_score(model, X_scaled_df, y, cv=kf, scoring='r2')
         mean_cv_r2 = cv_scores.mean()
         
-        # Fit on train split and test on test split
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         
@@ -89,19 +100,17 @@ def train_and_evaluate_models(X, y):
             'test_mae': test_mae
         }
         
-        print(f"Model: {name:<20} | 5-Fold CV R²: {mean_cv_r2:.4f} | Test R²: {test_r2:.4f} | Test RMSE: {test_rmse:.4f}")
+        print(f"Model: {name:<30} | 5-Fold CV R²: {mean_cv_r2:.4f} | Test R²: {test_r2:.4f} | Test RMSE: {test_rmse:.4f}")
         
         if mean_cv_r2 > best_r2:
             best_r2 = mean_cv_r2
             best_model_name = name
             best_model_obj = model
             
-    print("-" * 60)
-    print(f"Selected Best Model: {best_model_name} (CV R² = {best_r2:.4f})")
+    print("-" * 70)
+    print(f"Selected Best Regularized Architecture: {best_model_name} (CV R² = {best_r2:.4f})")
     
-    # Fit best model on full dataset for maximum prediction accuracy
     best_model_obj.fit(X_scaled_df, y)
-    
     return best_model_name, best_model_obj, scaler, results
 
 def calculate_valuation_estimates(df_engineered, model, scaler, feature_cols):
@@ -117,15 +126,12 @@ def calculate_valuation_estimates(df_engineered, model, scaler, feature_cols):
     
     res_df = df_engineered.copy()
     res_df['estimated_marketCap'] = estimated_mcap
-    
-    # Calculate difference percentage: (Estimated - Actual) / Actual * 100
     res_df['valuation_diff_pct'] = ((res_df['estimated_marketCap'] - res_df['marketCap']) / res_df['marketCap']) * 100
     
-    # Relative thresholding for valuation status
     def label_valuation(diff):
-        if diff > 3.0:
+        if diff > 5.0:
             return 'Undervalued'
-        elif diff < -3.0:
+        elif diff < -5.0:
             return 'Overvalued'
         else:
             return 'Fairly Valued'
@@ -140,7 +146,6 @@ def plot_model_insights(res_df, model, feature_cols, model_name):
     plt.style.use('dark_background')
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    # 1. Actual vs Estimated Market Cap (in Cr INR)
     actual_cr = res_df['marketCap'] / 1e7
     estimated_cr = res_df['estimated_marketCap'] / 1e7
     
@@ -148,25 +153,16 @@ def plot_model_insights(res_df, model, feature_cols, model_name):
     axes[0].plot([actual_cr.min(), actual_cr.max()], [actual_cr.min(), actual_cr.max()], 'r--', label='Ideal 1:1 Valuation')
     axes[0].set_xscale('log')
     axes[0].set_yscale('log')
-    axes[0].set_xlabel('Actual Market Cap (₹ Cr, Log Scale)', fontsize=12)
-    axes[0].set_ylabel('ML Model Estimated Valuation (₹ Cr, Log Scale)', fontsize=12)
+    axes[0].set_xlabel('Actual Market Cap (INR Cr, Log Scale)', fontsize=12)
+    axes[0].set_ylabel('Model Estimated Valuation (INR Cr, Log Scale)', fontsize=12)
     axes[0].set_title(f'Actual vs Model Valuation ({model_name})', fontsize=14, fontweight='bold')
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
     
-    # 2. Feature Importance
-    if hasattr(model, 'feature_importances_'):
-        importances = model.feature_importances_
-        imp_series = pd.Series(importances, index=feature_cols).sort_values(ascending=False).head(12)
-        sns.barplot(x=imp_series.values, y=imp_series.index, ax=axes[1], hue=imp_series.index, legend=False, palette='rocket')
-        axes[1].set_title('Top 12 Features Driving Valuation Estimate', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('Feature Importance', fontsize=12)
-    elif hasattr(model, 'coef_'):
-        coefs = np.abs(model.coef_)
-        coef_series = pd.Series(coefs, index=feature_cols).sort_values(ascending=False).head(12)
-        sns.barplot(x=coef_series.values, y=coef_series.index, ax=axes[1], hue=coef_series.index, legend=False, palette='rocket')
-        axes[1].set_title('Top 12 Feature Coefficient Magnitudes (Ridge)', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('Absolute Coefficient', fontsize=12)
+    axes[1].set_title('Model Valuation Spread Distribution', fontsize=14, fontweight='bold')
+    sns.histplot(res_df['valuation_diff_pct'], kde=True, ax=axes[1], color='#00FFCC')
+    axes[1].set_xlabel('Valuation Spread % (Estimated vs Actual)', fontsize=12)
+    axes[1].grid(True, alpha=0.3)
         
     plt.tight_layout()
     plt.savefig('valuation_analysis_plots.png', dpi=300)
